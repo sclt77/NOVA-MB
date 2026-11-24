@@ -271,6 +271,30 @@ install_scripts() {
     local script_src="${NOVA_SCRIPTS_DIR:-}"
     ensure_dir "$PANEL_DIR/scripts" "$PANEL_USER:$PANEL_USER" "755"
 
+    # 运维脚本依赖 lib/common.sh（日志、权限、下载工具），
+    # 只装 scripts/ 不装 lib/ 会让 deploy.sh 启动就报「找不到 lib 目录」。
+    # 之前就是这样：脚本拷过去了，依赖没拷，所有运维操作全部失败。
+    ensure_dir "$PANEL_DIR/lib" "root:root" "755"
+
+    local lib_src="${NOVA_LIB_DIR:-}"
+    if [[ -z "$lib_src" ]]; then
+        # 单文件模式下 lib 被下载到临时目录，和 install.sh 同级的 lib 也存在
+        if [[ -d "$(dirname "${BASH_SOURCE[0]}")/../lib" ]]; then
+            lib_src="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
+        elif [[ -d "${LIB_DIR:-}" ]]; then
+            lib_src="$LIB_DIR"
+        fi
+    fi
+
+    if [[ -n "$lib_src" && -d "$lib_src" ]]; then
+        cp -f "$lib_src"/*.sh "$PANEL_DIR/lib/" 2>/dev/null || true
+        chmod 644 "$PANEL_DIR/lib"/*.sh 2>/dev/null || true
+        chown -R root:root "$PANEL_DIR/lib"
+        ok "公共库已安装：$(ls -1 "$PANEL_DIR/lib" 2>/dev/null | wc -l) 个"
+    else
+        warn "未找到 lib 目录，运维脚本可能无法运行"
+    fi
+
     if [[ -n "$script_src" && -d "$script_src" ]]; then
         cp -f "$script_src"/*.sh "$PANEL_DIR/scripts/" 2>/dev/null || true
         chmod 755 "$PANEL_DIR/scripts"/*.sh 2>/dev/null || true
