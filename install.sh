@@ -181,6 +181,9 @@ main() {
     info "安装日志：$LOG_FILE"
 
     # 1. 环境识别
+    # shellcheck source=lib/detect.sh
+    . "${LIB_DIR}/detect.sh"
+
     detect_os
     detect_arch
     detect_init
