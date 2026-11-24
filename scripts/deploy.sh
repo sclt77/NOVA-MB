@@ -115,30 +115,55 @@ validate_package() {
 
     # 结构检查。
     #
-    # 用 unzip -Z1 取纯文件名列表，不用 `unzip -l`。
-    # 后者输出的是带表头、日期、大小、空格对齐的表格，不同 unzip 版本
-    # 格式还有差异（Ubuntu 的 unzip 6.0 和 BusyBox 的 unzip 输出完全不同），
-    # 用正则匹配表格内容很容易在某个版本上误判成「缺少文件」。
-    local names
-    names="$(unzip -Z1 "$pkg" 2>/dev/null || true)"
+    # 用 unzip -Z1 取纯文件名列表，不用 `unzip -l` 的表格输出。
+    # 后者带表头、日期、大小、空格对齐，不同 unzip 版本格式有差异
+    # （Ubuntu 6.0 和 BusyBox 输出完全不同），正则匹配极易误判。
+    #
+    # 这里把列表写进临时文件再逐行判断，不用 here-string：
+    # 在 `set -e` 下 here-string 的空值处理容易出意外，临时文件更直白。
+    local names_file
+    names_file="$(mktemp)"
+    # shellcheck disable=SC2064
+    trap "rm -f '$names_file'" RETURN
 
-    [[ -n "$names" ]] || die "无法读取包内文件列表（unzip -Z1 无输出）"
-
-    # 精确匹配：允许文件在根目录或某一层子目录下
-    if ! awk -F/ '{n=NF; if ($n=="nova-api.jar") found=1} END{exit !found}' <<<"$names"; then
-        die "包内缺少 nova-api.jar
-包内实际内容（前 20 项）：
-$(head -20 <<<"$names" | sed 's/^/    /')"
+    if ! unzip -Z1 "$pkg" >"$names_file" 2>/dev/null; then
+        die "无法读取包内文件列表"
     fi
 
-    if ! grep -qxF 'web/index.html' <<<"$names" && \
-       ! grep -qE '(^|/)web/index\.html$' <<<"$names"; then
-        die "包内缺少 web/index.html
-包内实际内容（前 20 项）：
-$(head -20 <<<"$names" | sed 's/^/    /')"
+    local total
+    total="$(wc -l <"$names_file" | tr -d ' ')"
+    if [ "$total" -eq 0 ]; then
+        die "包内没有文件"
     fi
+
+    # 判断某个文件名是否存在于列表中（精确匹配整行）
+    local has_jar=0 has_index=0
+    local line
+    while IFS= read -r line; do
+        # 去掉可能的 \r（Windows 打包时行尾可能带 CR）
+        line="${line%$'\r'}"
+        [ "$line" = "nova-api.jar" ] && has_jar=1
+        [ "$line" = "web/index.html" ] && has_index=1
+    done <"$names_file"
+
+    if [ "$has_jar" -eq 0 ]; then
+        err "包内缺少 nova-api.jar"
+        err "包内实际内容（共 ${total} 项，前 20 项）："
+        head -20 "$names_file" | sed 's/^/    /' >&2
+        die "部署包结构不正确"
+    fi
+
+    if [ "$has_index" -eq 0 ]; then
+        err "包内缺少 web/index.html"
+        err "包内实际内容（共 ${total} 项，前 20 项）："
+        head -20 "$names_file" | sed 's/^/    /' >&2
+        die "部署包结构不正确"
+    fi
+
+    ok "包结构正确（${total} 个文件）"
 
     while IFS= read -r name; do
+        name="${name%$'\r'}"
         [[ -z "$name" ]] && continue
 
         # 绝对路径：解压会写到包外的位置
@@ -151,7 +176,7 @@ $(head -20 <<<"$names" | sed 's/^/    /')"
         if [[ "/${name}/" == *"/../"* ]]; then
             die "包内含路径穿越：$name"
         fi
-    done <<<"$names"
+    done <"$names_file"
 
     ok "包校验通过（${size_mb}MB）"
 }
