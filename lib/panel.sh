@@ -199,21 +199,55 @@ install_panel_binary() {
     local bin_url="${NOVA_PANEL_BIN_URL:-}"
     local bin_sha="${NOVA_PANEL_BIN_SHA256:-}"
 
-    # 没指定地址时按架构从默认位置下载
-    if [[ -z "$bin_url" ]]; then
+    # 组装下载地址列表：主地址 + 备用镜像。
+    #
+    # 国内服务器访问 GitHub Release 经常超时或很慢，只给一个地址
+    # 等于把安装成功率赌在网络上。这里按顺序尝试，任一成功即用。
+    local -a urls=()
+    if [[ -n "$bin_url" ]]; then
+        urls+=("$bin_url")
+    else
         local base="${NOVA_RELEASE_BASE:-https://github.com/sclt77/NOVA-MB/releases/latest/download}"
-        bin_url="${base}/nova-panel-linux-${ARCH}"
-        info "使用默认下载地址：$bin_url"
+        local file="nova-panel-linux-${ARCH}"
+        urls+=("${base}/${file}")
+        # 镜像只在没显式指定 NOVA_RELEASE_BASE 时追加，
+        # 用户自己指定了源说明他知道要什么，不该被塞别的。
+        if [[ -z "${NOVA_RELEASE_BASE:-}" ]]; then
+            urls+=("https://ghproxy.net/${base}/${file}")
+            urls+=("https://gh-proxy.com/${base}/${file}")
+        fi
     fi
 
     local tmp_bin="/tmp/nova-panel-$$"
     info "下载面板程序（约 12MB）"
-    if ! download "$bin_url" "$tmp_bin"; then
-        warn "面板程序下载失败。"
-        warn "环境已就绪，但面板未安装。可以："
-        warn "  1. 检查网络后重新执行本脚本"
-        warn "  2. 手动下载后放到 $PANEL_DIR/nova-panel 并 chmod +x"
-        return 0
+
+    local got=0 url
+    for url in "${urls[@]}"; do
+        info "  尝试：$url"
+        if download "$url" "$tmp_bin" 3; then
+            got=1
+            bin_url="$url"
+            break
+        fi
+        warn "  该地址失败，尝试下一个"
+    done
+
+    if [ "$got" -eq 0 ]; then
+        # 必须中止，不能只警告。
+        # 之前这里 return 0 继续往下装，结果是「安装完成」但面板根本不存在，
+        # 用户看到成功的汇总信息却连不上，排查半天才发现是下载失败。
+        err "面板程序下载失败，已尝试 ${#urls[@]} 个地址"
+        err ""
+        err "环境已就绪，但面板没装上。三种解决办法："
+        err "  1. 检查网络后重新执行本脚本（脚本是幂等的）"
+        err "  2. 手动下载后放到 $PANEL_DIR/nova-panel 并 chmod +x："
+        err "     curl -L -o /tmp/np ${urls[0]}"
+        err "     install -m 755 /tmp/np $PANEL_DIR/nova-panel"
+        err "     chown $PANEL_USER:$PANEL_USER $PANEL_DIR/nova-panel"
+        err "  3. 用国内镜像重跑："
+        err "     NOVA_RELEASE_BASE=https://ghproxy.net/https://github.com/sclt77/NOVA-MB/releases/latest/download \\"
+        err "       bash install.sh"
+        die "安装中止：面板程序缺失"
     fi
 
     # 有校验值就校验，没有就提示（默认地址不提供 SHA，靠 HTTPS 保证）
