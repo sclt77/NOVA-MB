@@ -1,6 +1,6 @@
 # NOVA-MB
 
-Nova 的一键部署面板。**独立项目**，与 Nova 业务代码（`D:/NOVA`）分开维护、分开发版。
+Nova 的一键部署面板。**独立项目**，与 Nova 业务代码分开维护、分开发版。
 
 ```bash
 curl -sSO https://raw.githubusercontent.com/sclt77/NOVA-MB/main/install.sh
