@@ -8,7 +8,28 @@ print_summary() {
     local public_ip="${PUBLIC_IP:-127.0.0.1}"
     local panel_port="${NOVA_PANEL_PORT:-8888}"
     local panel_user="${NOVA_PANEL_ADMIN_USER:-admin}"
-    local panel_pass="${NOVA_PANEL_ADMIN_PASS:-（未生成）}"
+
+    # 初始密码由面板程序在首次启动时生成并写入文件，
+    # 安装脚本拿不到内存里的值，只能读文件。
+    # 之前这里写的是 ${NOVA_PANEL_ADMIN_PASS:-（未生成）}，但那个变量
+    # 从来没被赋值过，所以永远显示「（未生成）」，让人误以为安装失败。
+    local panel_pass=""
+    local pass_file="/var/lib/nova/panel/initial-password.txt"
+
+    # 等面板把文件写出来（首次启动要初始化 SQLite，可能要几秒）
+    local waited=0
+    while [ ! -f "$pass_file" ] && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [ -f "$pass_file" ]; then
+        panel_pass=$(grep -m1 '密码' "$pass_file" 2>/dev/null | sed 's/^[^:]*:[[:space:]]*//')
+    fi
+
+    if [ -z "$panel_pass" ]; then
+        panel_pass="（请执行 sudo cat ${pass_file} 查看）"
+    fi
 
     local line="════════════════════════════════════════════════════"
     local thin="────────────────────────────────────────────────────"
@@ -78,13 +99,24 @@ print_summary() {
 
 print_service_state() {
     local unit="$1" label="$2"
+
+    # 服务不存在时 systemctl is-active 会输出 unknown，
+    # 要单独区分「没装」和「装了但停了」，否则用户分不清是安装失败还是正常停服。
     local state
-    state="$(systemctl is-active "$unit" 2>/dev/null || echo "未安装")"
+    if ! systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+         | awk '{print $1}' | grep -qx "${unit}.service"; then
+        state="未安装"
+    else
+        state="$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
+    fi
 
     local mark color
     case "$state" in
         active)
             mark="●" color="$C_GREEN"
+            ;;
+        activating|reloading)
+            mark="◐" color="$C_YELLOW"
             ;;
         inactive|未安装)
             mark="○" color="$C_YELLOW"
@@ -97,5 +129,16 @@ print_service_state() {
             ;;
     esac
 
-    printf '    %s%s%s %-12s %s\n' "$color" "$mark" "$C_RESET" "$label" "$state"
+    # 不用 %-12s 对齐：printf 按字节补空格，中文标签一个字占 3 字节，
+    # 「Nova 后端」是 13 字节，会被补成负宽度导致状态粘在标签后面。
+    # 改成手动算显示宽度（中文字符按 2 列算）。
+    # 不用 %-12s 对齐：printf 按字节补空格，中文标签一个字占 3 字节，
+    # 补出来的宽度是错的，状态会粘在标签后面。
+    #
+    # 也不去算显示宽度——bash 算宽字符在跨平台时坑很多
+    # （${#var} 是字符数不是列数，正则 \x{} 在旧 bash 不支持，
+    # awk 的 length 在 C locale 下按字节返回）。
+    #
+    # 改用固定分隔符：标签和状态之间用「 · 」，不依赖对齐也能看清。
+    printf '    %s%s%s %s · %s\n' "$color" "$mark" "$C_RESET" "$label" "$state"
 }
