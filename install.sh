@@ -31,9 +31,14 @@ if [[ ! -d "$LIB_DIR" ]]; then
     TMP_LIB="$(mktemp -d)"
     trap 'rm -rf "$TMP_LIB"' EXIT
 
+    # 加时间戳绕过 CDN 缓存。
+    # raw.githubusercontent.com 有约 5 分钟缓存，刚推的修复会拿到旧文件，
+    # 表现为「明明改了代码，服务器上还是报同样的错」。
+    cache_bust="$(date +%s)"
+
     for mod in common detect deps java mysql nginx panel firewall summary; do
         if ! curl -fsSL --connect-timeout 15 -o "${TMP_LIB}/${mod}.sh" \
-             "${BASE_URL}/lib/${mod}.sh"; then
+             "${BASE_URL}/lib/${mod}.sh?t=${cache_bust}"; then
             echo "下载 lib/${mod}.sh 失败" >&2
             exit 1
         fi
@@ -45,6 +50,10 @@ fi
 
 # shellcheck source=lib/common.sh
 . "${LIB_DIR}/common.sh"
+
+# 打印模块版本：排查问题时能立刻确认加载的是哪一版，
+# 避免「改了代码但服务器跑的是旧的」这种低效排查。
+echo "NOVA-MB 模块版本：${NOVA_MB_VERSION:-未知}"
 
 # ---------------------------------------------------------------- 参数解析
 
