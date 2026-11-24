@@ -220,4 +220,28 @@ init_database() {
 
         ok "数据库 ${NOVA_DB} 与用户 ${NOVA_DB_USER} 创建完成"
     fi
+
+    # 最后无条件对齐一次密码。
+    #
+    # 为什么必须无条件：CREATE USER IF NOT EXISTS 在用户已存在时**不改密码**，
+    # 如果这个用户是上一次安装留下的（密码不同），GRANT 会成功但密码还是旧的，
+    # 后端连库就 Access denied。这个坑很难看出来——安装全部显示成功，
+    # 直到部署业务包时后端启动失败才暴露。
+    #
+    # 用 ALTER USER 保证 MySQL 里的密码和 /etc/nova/env 里记录的完全一致。
+    mysql_root_exec "
+        ALTER USER '${NOVA_DB_USER}'@'localhost' IDENTIFIED BY '${NOVA_DB_PASSWORD}';
+        GRANT ALL PRIVILEGES ON \`${NOVA_DB}\`.* TO '${NOVA_DB_USER}'@'localhost';
+        FLUSH PRIVILEGES;
+    " || die "设置数据库用户密码失败"
+
+    # 立即验证：密码真的能用。装完才发现连不上，比现在报错难查得多。
+    if mysql -h127.0.0.1 -u"${NOVA_DB_USER}" -p"${NOVA_DB_PASSWORD}" \
+         -e "SELECT 1" >/dev/null 2>&1; then
+        ok "数据库连接验证通过"
+    else
+        die "数据库密码验证失败：MySQL 里的密码与配置不一致
+请检查 /etc/nova/env 里的 NOVA_DB_PASSWORD，或手动重置：
+  ALTER USER '${NOVA_DB_USER}'@'localhost' IDENTIFIED BY '你的密码';"
+    fi
 }
