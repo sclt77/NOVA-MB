@@ -189,17 +189,24 @@ func (s *DomainService) writeLocationBlocks(b *strings.Builder, webRoot, backend
 	b.WriteString("    gzip_min_length 1024;\n")
 	b.WriteString("    gzip_comp_level 6;\n\n")
 
-	b.WriteString(`    # 静态资源：文件名带 hash 的长缓存
-    location ~* \.(?:js|css|png|jpg|jpeg|gif|webp|svg|woff2?|ttf|wasm)$ {
-        expires 7d;
-        add_header Cache-Control "public, max-age=604800";
+	b.WriteString(`    # 静态资源缓存策略。
+    # Flutter 的 main.dart.js / flutter.js 文件名固定（不带 hash），
+    # 绝不能长缓存，否则发新版用户拿不到新 JS。
+    location ~ ^/(main\.dart\.js|flutter\.js|flutter_bootstrap\.js|flutter_service_worker\.js)$ {
+        expires -1;
+        add_header Cache-Control "no-cache, must-revalidate";
         try_files $uri =404;
     }
 
-    # flutter_bootstrap.js 文件名固定，必须短缓存，否则发版后用户拿到旧文件
-    location = /flutter_bootstrap.js {
-        expires 5m;
-        add_header Cache-Control "public, max-age=300, must-revalidate";
+    location ~* \.(?:png|jpg|jpeg|gif|webp|svg|ico|woff2?|ttf|wasm)$ {
+        expires 30d;
+        add_header Cache-Control "public, max-age=2592000";
+        try_files $uri =404;
+    }
+
+    location ~* \.(?:js|css)$ {
+        expires 1h;
+        add_header Cache-Control "public, max-age=3600";
         try_files $uri =404;
     }
 
