@@ -149,8 +149,19 @@ EOF
 
     info "导出中（大库可能需要几分钟）"
     # shellcheck disable=SC2086
-    if ! mysqldump $mysql_cnf "${dump_opts[@]}" "$DB_NAME" 2>/dev/null | gzip -6 >"$db_file"; then
+    # 把 mysqldump 的 stderr 存到临时文件，不要直接丢弃。
+    # 之前用 2>/dev/null，失败时只知道「备份失败」，不知道是密码错、
+    # 权限不足还是数据库不存在，排查全靠猜。
+    local dump_err
+    dump_err="$(mktemp)"
+    # shellcheck disable=SC2064
+    trap "rm -f '$dump_err'" RETURN
+
+    if ! mysqldump $mysql_cnf "${dump_opts[@]}" "$DB_NAME" \
+         2>"$dump_err" | gzip -6 >"$db_file"; then
         rm -f "$db_file"
+        err "mysqldump 报错："
+        sed 's/^/    /' "$dump_err" >&2
         die "数据库备份失败"
     fi
 
@@ -159,6 +170,9 @@ EOF
     db_file_kb=$(( $(stat -c%s "$db_file" 2>/dev/null || echo 0) / 1024 ))
     if (( db_file_kb < 1 )); then
         rm -f "$db_file"
+        err "mysqldump 报错："
+        sed 's/^/    /' "$dump_err" >&2
+        err "使用的连接配置：$mysql_cnf"
         die "备份文件异常（${db_file_kb}KB），可能是导出失败"
     fi
 
