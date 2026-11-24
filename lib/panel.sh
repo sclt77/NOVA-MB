@@ -13,6 +13,8 @@ PANEL_DIR="/opt/nova/panel"
 APP_DIR="/opt/nova/app"
 RELEASES_DIR="/opt/nova/releases"
 DATA_DIR="/var/lib/nova"
+# 面板自己的数据（SQLite、会话密钥、上传的部署包），属主是面板用户
+PANEL_DATA_DIR="/var/lib/nova/panel"
 UPLOAD_DIR="/var/lib/nova/uploads"
 BACKUP_DIR="/var/lib/nova/backup"
 CONF_DIR="/etc/nova"
@@ -54,11 +56,34 @@ create_dirs() {
     ensure_dir "$PANEL_DIR"  "$PANEL_USER:$PANEL_USER" "755"
     ensure_dir "$APP_DIR"    "$APP_USER:$APP_USER"     "755"
     ensure_dir "$RELEASES_DIR" "root:root"             "755"
-    ensure_dir "$DATA_DIR"   "$APP_USER:$APP_USER"     "755"
     ensure_dir "$UPLOAD_DIR" "$APP_USER:$APP_USER"     "755"
     ensure_dir "$BACKUP_DIR" "$APP_USER:$APP_USER"     "700"   # 备份含用户数据
     ensure_dir "$CONF_DIR"   "root:root"               "750"
     ensure_dir "$LOG_DIR"    "$APP_USER:$APP_USER"     "755"
+
+    # 面板自己的数据目录必须**单独**建，并且属主是面板用户。
+    #
+    # 不能只建 /var/lib/nova 就指望面板自己创建子目录：
+    # /var/lib/nova 属主是 nova（业务用户）、权限 755，
+    # 面板以 nova-panel 身份运行，在别人的目录里建子目录会 permission denied。
+    # 这个坑在真机第一次跑就踩到了，表现为面板无限重启（restart counter 一直涨）。
+    ensure_dir "$DATA_DIR"        "$APP_USER:$APP_USER"     "755"
+    ensure_dir "$PANEL_DATA_DIR"  "$PANEL_USER:$PANEL_USER" "700"
+
+    # ensure_dir 对已存在的目录不会改属主，重装时会保留旧的错误权限，
+    # 导致面板继续 permission denied。这里强制修正一次。
+    # chown -R 是安全的：这个目录只存面板自己的数据（SQLite、会话密钥、上传包）。
+    if [ -d "$PANEL_DATA_DIR" ]; then
+        chown -R "$PANEL_USER:$PANEL_USER" "$PANEL_DATA_DIR" 2>/dev/null || true
+        chmod 700 "$PANEL_DATA_DIR" 2>/dev/null || true
+    fi
+
+    # 业务用户要能读面板目录下的 packages（部署包上传目录），
+    # 否则面板上传的包业务脚本读不到。用 ACL 而不是放宽权限，
+    # 避免把整个面板数据目录暴露给业务进程。
+    if command -v setfacl >/dev/null 2>&1; then
+        setfacl -m "u:${APP_USER}:rx" "$PANEL_DATA_DIR" 2>/dev/null || true
+    fi
 
     ok "目录结构就绪"
 }
