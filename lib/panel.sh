@@ -154,20 +154,42 @@ EOF
 install_panel_binary() {
     step "安装面板程序"
 
-    local bin_url="${NOVA_PANEL_BIN_URL:-}"
-    local bin_sha="${NOVA_PANEL_BIN_SHA256:-}"
-
-    if [[ -z "$bin_url" ]]; then
-        warn "未指定面板二进制下载地址（NOVA_PANEL_BIN_URL），跳过面板程序安装"
-        warn "环境已就绪，可稍后手动部署面板。"
+    # 本地已有二进制（离线安装 / 开发调试）就直接用
+    if [[ -n "${NOVA_PANEL_BIN_LOCAL:-}" && -f "$NOVA_PANEL_BIN_LOCAL" ]]; then
+        info "使用本地面板程序：$NOVA_PANEL_BIN_LOCAL"
+        install -m 755 "$NOVA_PANEL_BIN_LOCAL" "$PANEL_DIR/nova-panel" \
+            || die "安装面板程序失败"
+        chown "$PANEL_USER:$PANEL_USER" "$PANEL_DIR/nova-panel"
+        ok "面板程序已安装"
         return 0
     fi
 
-    local tmp_bin="/tmp/nova-panel-$$"
-    info "下载面板程序"
-    download "$bin_url" "$tmp_bin" || die "面板程序下载失败：$bin_url"
+    local bin_url="${NOVA_PANEL_BIN_URL:-}"
+    local bin_sha="${NOVA_PANEL_BIN_SHA256:-}"
 
-    verify_sha256 "$tmp_bin" "$bin_sha" || die "面板程序校验失败，已中止"
+    # 没指定地址时按架构从默认位置下载
+    if [[ -z "$bin_url" ]]; then
+        local base="${NOVA_RELEASE_BASE:-https://github.com/sclt77/NOVA-MB/releases/latest/download}"
+        bin_url="${base}/nova-panel-linux-${ARCH}"
+        info "使用默认下载地址：$bin_url"
+    fi
+
+    local tmp_bin="/tmp/nova-panel-$$"
+    info "下载面板程序（约 12MB）"
+    if ! download "$bin_url" "$tmp_bin"; then
+        warn "面板程序下载失败。"
+        warn "环境已就绪，但面板未安装。可以："
+        warn "  1. 检查网络后重新执行本脚本"
+        warn "  2. 手动下载后放到 $PANEL_DIR/nova-panel 并 chmod +x"
+        return 0
+    fi
+
+    # 有校验值就校验，没有就提示（默认地址不提供 SHA，靠 HTTPS 保证）
+    if [[ -n "$bin_sha" ]]; then
+        verify_sha256 "$tmp_bin" "$bin_sha" || die "面板程序校验失败，已中止"
+    else
+        warn "未提供 SHA256，跳过校验（下载来源为 HTTPS）"
+    fi
 
     install -m 755 "$tmp_bin" "$PANEL_DIR/nova-panel" || die "安装面板程序失败"
     rm -f "$tmp_bin"
