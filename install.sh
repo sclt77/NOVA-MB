@@ -199,6 +199,13 @@ main() {
     write_systemd_units
     setup_logrotate
 
+    # 定时任务：备份、验证、健康检查。不装的话备份永远不会自动跑。
+    if [[ -x "${PANEL_DIR}/scripts/cron.sh" ]]; then
+        "${PANEL_DIR}/scripts/cron.sh" install || warn "定时任务安装失败，可稍后手动执行"
+    else
+        warn "cron.sh 未安装，跳过定时任务配置"
+    fi
+
     # 5. Nginx 站点（此时 uploads 目录已建好）
     write_nginx_site "$NOVA_DOMAIN" "8080"
 
