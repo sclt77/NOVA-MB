@@ -3,6 +3,10 @@
 #
 # 被 install.sh 与 scripts/*.sh source。不要直接执行。
 
+# 版本标识。排查问题时先看这个，确认加载的是哪一版模块。
+# 改动 common.sh 时同步更新，避免出现「明明改了却没生效」的困惑。
+NOVA_MB_VERSION="2026-11-24.3"
+
 # 只在被 source 时生效，避免误执行
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     echo "这个文件是被 source 的，不要直接执行" >&2
