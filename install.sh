@@ -139,6 +139,28 @@ do_uninstall() {
     exit 0
 }
 
+# fetch_scripts 单文件模式下把运维脚本下载到临时目录。
+#
+# curl | bash 时本地没有 scripts/ 目录，但这些脚本是面板执行动作的实体，
+# 必须落到 /opt/nova/panel/scripts 才能工作。
+fetch_scripts() {
+    local base="${NOVA_BASE_URL:-https://raw.githubusercontent.com/sclt77/NOVA-MB/main}"
+    local dir
+    dir="$(mktemp -d)"
+
+    info "下载运维脚本" >&2
+
+    local list=(deploy.sh backup.sh restore.sh healthcheck.sh cron.sh)
+    for name in "${list[@]}"; do
+        if ! curl -fsSL --connect-timeout 15 -o "${dir}/${name}" "${base}/scripts/${name}"; then
+            die "下载 scripts/${name} 失败"
+        fi
+        chmod 755 "${dir}/${name}"
+    done
+
+    echo "$dir"
+}
+
 # ---------------------------------------------------------------- 主流程
 
 main() {
@@ -190,6 +212,15 @@ main() {
     # 4. 面板与业务
     # shellcheck source=lib/panel.sh
     . "${LIB_DIR}/panel.sh"
+
+    # 运维脚本来源：本地目录优先，单文件模式下从仓库下载
+    if [[ -z "${NOVA_SCRIPTS_DIR:-}" ]]; then
+        if [[ -d "${SCRIPT_DIR}/scripts" ]]; then
+            NOVA_SCRIPTS_DIR="${SCRIPT_DIR}/scripts"
+        else
+            NOVA_SCRIPTS_DIR="$(fetch_scripts)"
+        fi
+    fi
     create_users
     create_dirs
     write_env_file
