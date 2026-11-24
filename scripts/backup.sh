@@ -165,18 +165,43 @@ EOF
         die "数据库备份失败"
     fi
 
-    # mysqldump 失败时可能留下一个很小的 gz，必须检查大小
-    local db_file_kb
-    db_file_kb=$(( $(stat -c%s "$db_file" 2>/dev/null || echo 0) / 1024 ))
-    if (( db_file_kb < 1 )); then
+    # 检查备份文件是否有效。
+    #
+    # 不能用「KB 数 < 1」判断：空库（只有表结构没数据）导出后压缩只有
+    # 几百字节，490/1024 = 0，会被误判成「导出失败」。
+    # 首次部署时数据库正好是空的，所以这个判断一定会误伤。
+    #
+    # 改成检查字节数是否大于 0，并且验证 gzip 能正常解压
+    # （解压失败说明文件损坏，这比大小判断可靠）。
+    local db_file_bytes
+    db_file_bytes="$(stat -c%s "$db_file" 2>/dev/null || echo 0)"
+
+    if (( db_file_bytes == 0 )); then
         rm -f "$db_file"
         err "mysqldump 报错："
         sed 's/^/    /' "$dump_err" >&2
         err "使用的连接配置：$mysql_cnf"
-        die "备份文件异常（${db_file_kb}KB），可能是导出失败"
+        die "备份文件为空，导出失败"
     fi
 
-    ok "数据库已备份：$(basename "$db_file")（${db_file_kb}KB）"
+    # gzip 完整性校验：能完整解压才说明文件没坏
+    if ! gzip -t "$db_file" 2>/dev/null; then
+        rm -f "$db_file"
+        err "mysqldump 报错："
+        sed 's/^/    /' "$dump_err" >&2
+        die "备份文件损坏（gzip 校验失败）"
+    fi
+
+    local size_human
+    if (( db_file_bytes >= 1048576 )); then
+        size_human="$(( db_file_bytes / 1048576 ))MB"
+    elif (( db_file_bytes >= 1024 )); then
+        size_human="$(( db_file_bytes / 1024 ))KB"
+    else
+        size_human="${db_file_bytes}B"
+    fi
+
+    ok "数据库已备份：$(basename "$db_file")（${size_human}）"
 
     # ---- 上传文件 ----
     local up_file=""
@@ -212,7 +237,7 @@ EOF
         echo "time=${stamp}"
         echo "db=${db_file}"
         echo "uploads=${up_file}"
-        echo "db_size_kb=${db_file_kb}"
+        echo "db_size_bytes=${db_file_bytes}"
         echo "type=$([[ "$quick" == "1" ]] && echo quick || echo full)"
     } >"$manifest"
     chmod 600 "$manifest" "$db_file" 2>/dev/null || true
