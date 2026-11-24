@@ -58,18 +58,33 @@ server {
     gzip_min_length 1024;
     gzip_comp_level 6;
 
-    # 静态资源长缓存。文件名带 hash 的可以永久缓存，
-    # 但 Flutter 的 flutter_bootstrap.js 文件名固定，必须短缓存，
-    # 否则发新版用户拿到旧文件。
-    location ~* \.(?:js|css|png|jpg|jpeg|gif|webp|svg|woff2?|ttf|wasm)\$ {
-        expires 7d;
-        add_header Cache-Control "public, max-age=604800";
+    # 静态资源缓存策略。
+    #
+    # 关键点：**不能给 main.dart.js / flutter.js 设长缓存**。
+    # Flutter Web 产物的文件名是固定的（不带内容 hash），
+    # 设 7 天缓存后发新版，用户浏览器会一直用旧 JS，
+    # 表现为「代码改了但界面没变」——首次部署就踩过这个坑。
+    #
+    # 只有文件名带 hash 的资源（如图片、字体）才适合长缓存。
+
+    # Flutter 的核心 JS：必须每次校验，不能长缓存
+    location ~ ^/(main\.dart\.js|flutter\.js|flutter_bootstrap\.js|flutter_service_worker\.js)$ {
+        expires -1;
+        add_header Cache-Control "no-cache, must-revalidate";
         try_files \$uri =404;
     }
 
-    location = /flutter_bootstrap.js {
-        expires 5m;
-        add_header Cache-Control "public, max-age=300, must-revalidate";
+    # 图片、字体、wasm：内容变了文件名通常也变，可以长缓存
+    location ~* \.(?:png|jpg|jpeg|gif|webp|svg|ico|woff2?|ttf|wasm)\$ {
+        expires 30d;
+        add_header Cache-Control "public, max-age=2592000";
+        try_files \$uri =404;
+    }
+
+    # 其余 JS/CSS（通常是框架或插件）：中等缓存
+    location ~* \.(?:js|css)\$ {
+        expires 1h;
+        add_header Cache-Control "public, max-age=3600";
         try_files \$uri =404;
     }
 
