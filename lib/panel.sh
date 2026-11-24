@@ -78,11 +78,18 @@ create_dirs() {
         chmod 700 "$PANEL_DATA_DIR" 2>/dev/null || true
     fi
 
-    # 业务用户要能读面板目录下的 packages（部署包上传目录），
-    # 否则面板上传的包业务脚本读不到。用 ACL 而不是放宽权限，
-    # 避免把整个面板数据目录暴露给业务进程。
+    # 部署包目录：面板上传到这里，deploy.sh 以 root 执行时读它。
+    # 单独建出来并给业务用户读权限，避免把整个面板数据目录（含 SQLite、
+    # 会话密钥）暴露给业务进程。
+    ensure_dir "${PANEL_DATA_DIR}/packages" "$PANEL_USER:$PANEL_USER" "750"
+
     if command -v setfacl >/dev/null 2>&1; then
-        setfacl -m "u:${APP_USER}:rx" "$PANEL_DATA_DIR" 2>/dev/null || true
+        # 只给 packages 目录递归读权限，不动 SQLite 所在的父目录
+        setfacl -R -m "u:${APP_USER}:r-x" "${PANEL_DATA_DIR}/packages" 2>/dev/null || true
+        setfacl -m "u:${APP_USER}:x" "$PANEL_DATA_DIR" 2>/dev/null || true
+    else
+        # 没有 setfacl 时退回普通权限：组读
+        chmod 750 "${PANEL_DATA_DIR}/packages" 2>/dev/null || true
     fi
 
     ok "目录结构就绪"
