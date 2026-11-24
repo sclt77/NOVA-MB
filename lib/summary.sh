@@ -102,9 +102,21 @@ print_service_state() {
 
     # 服务不存在时 systemctl is-active 会输出 unknown，
     # 要单独区分「没装」和「装了但停了」，否则用户分不清是安装失败还是正常停服。
+    # 判断 unit 是否存在。
+    #
+    # 不能用 `grep -qx`：list-unit-files 每行是
+    #   nginx.service  enabled  enabled
+    # 有多个字段，-x 要求整行完全匹配，永远匹配不上，
+    # 结果是所有服务都被误报成「未安装」。
+    # 改用 `awk '{print $1}'` 取第一列后做精确比较。
     local state
-    if ! systemctl list-unit-files --type=service --no-legend 2>/dev/null \
-         | awk '{print $1}' | grep -qx "${unit}.service"; then
+    local exists=0
+    if systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+         | awk '{print $1}' | grep -qxF "${unit}.service"; then
+        exists=1
+    fi
+
+    if [ "$exists" -eq 0 ]; then
         state="未安装"
     else
         state="$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
