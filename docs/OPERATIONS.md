@@ -266,3 +266,69 @@ sudo systemctl restart nova-api
 | 上传目录 | `/var/lib/nova/uploads` |
 
 只要这些不变，业务代码怎么改都不影响面板。
+
+## 面板本身
+
+### 启动与停止
+
+```bash
+systemctl start nova-panel
+systemctl stop nova-panel
+systemctl status nova-panel
+journalctl -u nova-panel -n 50 --no-pager
+```
+
+### 忘记密码
+
+```bash
+# 停服务后重置，新密码会打印到终端
+systemctl stop nova-panel
+/opt/nova/panel/nova-panel --reset-password
+systemctl start nova-panel
+```
+
+### 面板访问不了
+
+面板默认只监听 `127.0.0.1`，这是**有意为之**——不对外暴露才安全。
+
+```bash
+# 方式一：SSH 端口转发（推荐）
+ssh -L 8888:127.0.0.1:8888 root@你的服务器
+# 本地浏览器打开 http://127.0.0.1:8888
+
+# 方式二：确实要对外暴露（不推荐）
+# 编辑 /etc/systemd/system/nova-panel.service，改 ExecStart 加 --listen 0.0.0.0
+# 然后用防火墙限制来源 IP，并配置 HTTPS
+```
+
+### 面板升级
+
+```bash
+# 下载新版本
+curl -sSL -o /tmp/nova-panel \
+  https://github.com/sclt77/NOVA-MB/releases/latest/download/nova-panel-linux-amd64
+chmod +x /tmp/nova-panel
+
+# 替换并重启
+systemctl stop nova-panel
+install -m 755 /tmp/nova-panel /opt/nova/panel/nova-panel
+chown nova-panel:nova-panel /opt/nova/panel/nova-panel
+systemctl start nova-panel
+```
+
+面板数据在 `/var/lib/nova/panel/panel.db`，升级不丢账号与审计记录。
+
+## 面板的边界
+
+**能做的**：部署、回滚、备份、恢复、域名、证书、服务启停、看日志、看数据库容量。
+
+**不能做的**（有意为之）：
+
+- 执行任意 shell 命令
+- 浏览任意目录文件
+- 安装任意软件
+- 执行任意 SQL
+- 编辑 Nginx 配置原文
+
+需要这些能力时请用 SSH。面板的定位是「让常见的运维动作更省事」，
+不是「替代 SSH」。
