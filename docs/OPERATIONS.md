@@ -4,7 +4,7 @@
 
 ### 打包
 
-在 Nova 业务仓库（`D:/NOVA`）执行：
+在 Nova 业务仓库根目录执行：
 
 ```bash
 cd /d/NOVA
