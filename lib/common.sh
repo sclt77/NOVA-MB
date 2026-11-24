@@ -115,8 +115,25 @@ service_enabled() {
 # 生成随机密码。用 /dev/urandom 而不是 $RANDOM（后者熵太低）。
 gen_password() {
     local len="${1:-16}"
-    # 去掉容易混淆的 0/O/1/l/I
-    tr -dc 'A-HJ-NP-Za-km-z2-9' </dev/urandom | head -c "$len"
+
+    # 不能写成 `tr -dc ... </dev/urandom | head -c N`：
+    # tr 会一直读到 /dev/urandom 结束（永远不结束），head 读够就关管道，
+    # tr 收到 SIGPIPE 退出（141），在 `set -o pipefail` 下整条管道返回 141，
+    # 再配合 `set -e` 直接把安装脚本打死。这个坑在真实服务器上才暴露。
+    #
+    # 改成：先取一块定长随机数据，再用 tr 过滤，最后截断。
+    # 整条链路都是有限输入，不会有 SIGPIPE。
+    local raw
+    raw=$(dd if=/dev/urandom bs=256 count=1 2>/dev/null \
+          | tr -dc 'A-HJ-NP-Za-km-z2-9')
+
+    # 极少数情况下过滤后不足 len（概率极低），补一次
+    while [ "${#raw}" -lt "$len" ]; do
+        raw="${raw}$(dd if=/dev/urandom bs=256 count=1 2>/dev/null \
+                      | tr -dc 'A-HJ-NP-Za-km-z2-9')"
+    done
+
+    printf '%s' "${raw:0:$len}"
 }
 
 # ---------------------------------------------------------------- 下载
