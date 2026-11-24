@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex, nofollow">
+<title>Nova 面板</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<!-- 登录页 -->
+<div id="login-view" class="login-wrap hidden">
+  <div class="login-card">
+    <div class="login-logo">
+      <div class="logo-mark">N</div>
+      <h1>Nova 面板</h1>
+      <p class="muted">服务器部署与运维</p>
+    </div>
+
+    <form id="login-form" autocomplete="off">
+      <label class="field">
+        <span>用户名</span>
+        <input type="text" id="login-user" autocomplete="username" required>
+      </label>
+      <label class="field">
+        <span>密码</span>
+        <input type="password" id="login-pass" autocomplete="current-password" required>
+      </label>
+      <div id="login-error" class="form-error hidden"></div>
+      <button type="submit" class="btn btn-primary btn-block" id="login-btn">登录</button>
+    </form>
+
+    <p class="login-tip">
+      面板仅监听内网。若无法访问，请用 SSH 端口转发：
+      <code>ssh -L 8888:127.0.0.1:8888 root@服务器</code>
+    </p>
+  </div>
+</div>
+
+<!-- 主界面 -->
+<div id="app-view" class="app hidden">
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <div class="logo-mark sm">N</div>
+      <div class="sidebar-title">
+        <strong>Nova</strong>
+        <span class="muted">部署面板</span>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <a class="nav-item active" data-page="overview">
+        <span class="nav-icon">◉</span><span>概览</span>
+      </a>
+      <a class="nav-item" data-page="deploy">
+        <span class="nav-icon">▲</span><span>部署管理</span>
+      </a>
+      <a class="nav-item" data-page="backup">
+        <span class="nav-icon">▣</span><span>备份恢复</span>
+      </a>
+      <a class="nav-item" data-page="domain">
+        <span class="nav-icon">◈</span><span>域名证书</span>
+      </a>
+      <a class="nav-item" data-page="database">
+        <span class="nav-icon">▤</span><span>数据库</span>
+      </a>
+      <a class="nav-item" data-page="cron">
+        <span class="nav-icon">◷</span><span>定时任务</span>
+      </a>
+      <a class="nav-item" data-page="logs">
+        <span class="nav-icon">≡</span><span>日志</span>
+      </a>
+      <a class="nav-item" data-page="audit">
+        <span class="nav-icon">✎</span><span>操作记录</span>
+      </a>
+      <a class="nav-item" data-page="settings">
+        <span class="nav-icon">⚙</span><span>设置</span>
+      </a>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="user-chip">
+        <span id="current-user">—</span>
+        <button id="logout-btn" class="link-btn" title="退出登录">退出</button>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-left">
+        <h2 id="page-title">概览</h2>
+        <span id="page-sub" class="muted"></span>
+      </div>
+      <div class="topbar-right">
+        <span id="alert-badge" class="alert-badge hidden"></span>
+        <button id="refresh-btn" class="btn btn-ghost" title="刷新">刷新</button>
+      </div>
+    </header>
+
+    <div id="page-content" class="content"></div>
+  </main>
+</div>
+
+<!-- 命令输出弹窗 -->
+<div id="modal" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="modal-title">执行结果</h3>
+      <button id="modal-close" class="icon-btn">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="modal-status" class="modal-status"></div>
+      <pre id="modal-output" class="code-block"></pre>
+    </div>
+    <div class="modal-foot">
+      <button id="modal-ok" class="btn btn-primary">知道了</button>
+    </div>
+  </div>
+</div>
+
+<!-- 确认弹窗 -->
+<div id="confirm" class="modal-mask hidden">
+  <div class="modal sm">
+    <div class="modal-head">
+      <h3 id="confirm-title">确认操作</h3>
+    </div>
+    <div class="modal-body">
+      <p id="confirm-text"></p>
+      <label class="field hidden" id="confirm-input-wrap">
+        <span id="confirm-input-label"></span>
+        <input type="text" id="confirm-input">
+      </label>
+    </div>
+    <div class="modal-foot">
+      <button id="confirm-cancel" class="btn btn-ghost">取消</button>
+      <button id="confirm-ok" class="btn btn-danger">确认</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
