@@ -19,13 +19,28 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ -d "${SCRIPT_DIR}/../lib" ]]; then
-    LIB_DIR="$(cd "${SCRIPT_DIR}/../lib" && pwd)"
-elif [[ -d "/opt/nova/panel/lib" ]]; then
+# 找 lib 目录。三种位置依次尝试：
+#   1. 面板安装位置：/opt/nova/panel/lib
+#   2. 与脚本同级的上层：../lib（开发时）
+#   3. 都没有 → 自动下载（脚本可能被单独拷到别处运行）
+if [[ -d "/opt/nova/panel/lib" ]]; then
     LIB_DIR="/opt/nova/panel/lib"
+elif [[ -d "${SCRIPT_DIR}/../lib" ]]; then
+    LIB_DIR="$(cd "${SCRIPT_DIR}/../lib" && pwd)"
 else
-    echo "找不到 lib 目录" >&2
-    exit 1
+    echo "本地没有 lib 目录，正在下载..." >&2
+    LIB_DIR="$(mktemp -d)"
+    trap 'rm -rf "$LIB_DIR"' EXIT
+    _base="${NOVA_BASE_URL:-https://raw.githubusercontent.com/sclt77/NOVA-MB/main}"
+    _ts="$(date +%s)"
+    for _m in common detect deps java mysql nginx panel firewall summary; do
+        if ! curl -fsSL --connect-timeout 15 -o "${LIB_DIR}/${_m}.sh" \
+             "${_base}/lib/${_m}.sh?t=${_ts}"; then
+            echo "下载 lib/${_m}.sh 失败，请检查网络" >&2
+            exit 1
+        fi
+    done
+    echo "lib 已下载到 $LIB_DIR" >&2
 fi
 
 # shellcheck source=../lib/common.sh
