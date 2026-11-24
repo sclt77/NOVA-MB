@@ -93,6 +93,11 @@ parse_args() {
 validate_package() {
     local pkg="$1"
 
+    # 版本标记。排查「改了代码但行为没变」时，先看这一行确认实际运行的是哪一版。
+    # 曾经因为 raw.githubusercontent.com 的 CDN 缓存，推了新代码但服务器
+    # 拿到的还是旧文件，白排查很久。
+    info "校验器版本：2026-11-24.5（unzip -Z1）"
+
     [[ -f "$pkg" ]] || die "包不存在：$pkg"
     [[ -s "$pkg" ]] || die "包是空文件：$pkg"
 
@@ -108,25 +113,30 @@ validate_package() {
         die "压缩包已损坏，请重新上传"
     fi
 
-    # 结构检查
-    local listing
-    listing="$(unzip -l "$pkg" 2>/dev/null || true)"
-
-    if ! grep -qE '(^|/)nova-api\.jar$' <<<"$listing"; then
-        die "包内缺少 nova-api.jar"
-    fi
-    if ! grep -qE '(^|/)web/index\.html$' <<<"$listing"; then
-        die "包内缺少 web/index.html"
-    fi
-
-    # zip slip 防护。
+    # 结构检查。
     #
-    # 用 unzip -Z1 只取文件名列表，不解析 `unzip -l` 的表格输出——
-    # 那个格式里有日期、大小、空格对齐，正则容易误判或漏判。
+    # 用 unzip -Z1 取纯文件名列表，不用 `unzip -l`。
+    # 后者输出的是带表头、日期、大小、空格对齐的表格，不同 unzip 版本
+    # 格式还有差异（Ubuntu 的 unzip 6.0 和 BusyBox 的 unzip 输出完全不同），
+    # 用正则匹配表格内容很容易在某个版本上误判成「缺少文件」。
     local names
     names="$(unzip -Z1 "$pkg" 2>/dev/null || true)"
 
-    [[ -n "$names" ]] || die "无法读取包内文件列表"
+    [[ -n "$names" ]] || die "无法读取包内文件列表（unzip -Z1 无输出）"
+
+    # 精确匹配：允许文件在根目录或某一层子目录下
+    if ! awk -F/ '{n=NF; if ($n=="nova-api.jar") found=1} END{exit !found}' <<<"$names"; then
+        die "包内缺少 nova-api.jar
+包内实际内容（前 20 项）：
+$(head -20 <<<"$names" | sed 's/^/    /')"
+    fi
+
+    if ! grep -qxF 'web/index.html' <<<"$names" && \
+       ! grep -qE '(^|/)web/index\.html$' <<<"$names"; then
+        die "包内缺少 web/index.html
+包内实际内容（前 20 项）：
+$(head -20 <<<"$names" | sed 's/^/    /')"
+    fi
 
     while IFS= read -r name; do
         [[ -z "$name" ]] && continue
