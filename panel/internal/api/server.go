@@ -560,7 +560,10 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
 	list, err := s.backup.List()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "读取备份列表失败")
+		// 把真实原因带出去。
+		// 之前这里固定返回「读取备份列表失败」，用户完全无法自查——
+		// 实际原因是权限不足，而这个信息就藏在 err 里被丢掉了。
+		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
