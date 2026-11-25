@@ -57,8 +57,25 @@ create_dirs() {
     ensure_dir "$APP_DIR"    "$APP_USER:$APP_USER"     "755"
     ensure_dir "$RELEASES_DIR" "root:root"             "755"
     ensure_dir "$UPLOAD_DIR" "$APP_USER:$APP_USER"     "755"
-    ensure_dir "$BACKUP_DIR" "$APP_USER:$APP_USER"     "700"   # 备份含用户数据
-    ensure_dir "$CONF_DIR"   "root:root"               "750"
+
+    # 备份目录：属主是业务用户 nova，但**面板要能读**（备份列表页）。
+    #
+    # 这里不能设 700。之前设 700 的后果是「备份恢复」页永远显示
+    # 「读取备份列表失败」——面板以 nova-panel 身份跑，读不了 nova 的
+    # 私有目录，而备份本身又是 root 写的（deploy.sh 用 sudo），
+    # 三者权限互不相交。
+    #
+    # 改成 750 + 属组 nova，再把 nova-panel 加进 nova 组（见下面
+    # grant_panel_group），面板就能列目录、读文件大小了。
+    ensure_dir "$BACKUP_DIR" "$APP_USER:$APP_USER"     "750"
+
+    # 配置目录：属组必须是业务用户。
+    #
+    # 面板要读 /etc/nova/env 拿数据库密码。文件本身是 640 root:nova，
+    # 但如果目录是 750 root:root，面板连目录都进不去 ——
+    # 文件权限再对也读不到，报 "Permission denied"。
+    # 这个坑很隐蔽：ls -l 看文件权限完全正常。
+    ensure_dir "$CONF_DIR"   "root:$APP_USER"          "750"
     ensure_dir "$LOG_DIR"    "$APP_USER:$APP_USER"     "755"
 
     # 面板自己的数据目录必须**单独**建，并且属主是面板用户。
@@ -93,6 +110,84 @@ create_dirs() {
     fi
 
     ok "目录结构就绪"
+}
+
+# grant_panel_group 把面板用户加入业务用户组。
+#
+# 为什么需要这一步：
+#
+# 面板以 nova-panel 身份运行，而备份、上传、数据库配置这些资源的
+# 属主都是业务用户 nova。两个用户互不相干，面板读不到任何东西：
+#   - 备份列表 → 读不了 /var/lib/nova/backup（属主 nova）
+#   - 数据库页 → 读不了 /etc/nova/env（属组 nova，640），
+#     拿不到密码就去连库，报 Access denied (using password: NO)
+#
+# 只加组、不改属主：nova 仍是这些目录的所有者，nova-panel 只是获得
+# 组读权限。这比把目录改成 nova-panel 所有更安全——业务进程才是
+# 真正写这些数据的人，不该让它失去所有权。
+grant_panel_group() {
+    step "配置面板访问权限"
+
+    # 把 nova-panel 加入 nova 组（幂等：已在组里不会重复添加）
+    if ! id -nG "$PANEL_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$APP_USER"; then
+        usermod -aG "$APP_USER" "$PANEL_USER" 2>/dev/null || \
+            warn "无法把 $PANEL_USER 加入 $APP_USER 组"
+        ok "已将 $PANEL_USER 加入 $APP_USER 组"
+    else
+        info "$PANEL_USER 已在 $APP_USER 组"
+    fi
+
+    # 加入 systemd-journal 组：面板「日志」页要读 journalctl。
+    #
+    # nova-api 与 nova-panel 都由 systemd 托管，输出进 journald，
+    # 不存在 /var/log/nova/nova-api.log 这种文件。不在该组里的用户
+    # 执行 journalctl 会得到 "No journal files were found"。
+    if getent group systemd-journal >/dev/null 2>&1; then
+        if ! id -nG "$PANEL_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "systemd-journal"; then
+            usermod -aG systemd-journal "$PANEL_USER" 2>/dev/null || \
+                warn "无法把 $PANEL_USER 加入 systemd-journal 组"
+            ok "已将 $PANEL_USER 加入 systemd-journal 组"
+        else
+            info "$PANEL_USER 已在 systemd-journal 组"
+        fi
+    fi
+
+    # 配置目录的属组：必须是业务用户组。
+    #
+    # 光把 env 文件设成 640 root:nova 不够——目录若是 750 root:root，
+    # 面板连进都进不去（x 位缺失），读文件直接 Permission denied。
+    # 而且 ls -l 看文件权限是完全正常的，极易误判。
+    #
+    # ensure_dir 对已存在的目录不改属主，所以这里强制修正一次。
+    if [ -d "$CONF_DIR" ]; then
+        chgrp "$APP_USER" "$CONF_DIR" 2>/dev/null || true
+        chmod 750 "$CONF_DIR" 2>/dev/null || true
+    fi
+
+    # 环境变量文件：root 写、nova 组读。
+    # 面板要从中读 NOVA_DB_PASSWORD / NOVA_PUBLIC_URL 等。
+    # 640 保证其他用户（包括 www-data）读不到数据库密码。
+    if [ -f "$ENV_FILE" ]; then
+        chown "root:$APP_USER" "$ENV_FILE" 2>/dev/null || true
+        chmod 640 "$ENV_FILE" 2>/dev/null || true
+    fi
+
+    # 备份目录递归修正：历史备份是 root 写的 600，
+    # 面板即使有组权限也读不了，统一放开到组可读。
+    if [ -d "$BACKUP_DIR" ]; then
+        chgrp -R "$APP_USER" "$BACKUP_DIR" 2>/dev/null || true
+        find "$BACKUP_DIR" -type d -exec chmod 750 {} \; 2>/dev/null || true
+        find "$BACKUP_DIR" -type f -exec chmod 640 {} \; 2>/dev/null || true
+    fi
+
+    # MySQL root 凭据：面板的「数据库」页要用它查表结构与慢查询。
+    # 这个文件只有 root 能读，所以面板走 sudo cat（见 sudoers 白名单）。
+    if [ -f "${CONF_DIR}/.mysql-root.cnf" ]; then
+        chown root:root "${CONF_DIR}/.mysql-root.cnf" 2>/dev/null || true
+        chmod 600 "${CONF_DIR}/.mysql-root.cnf" 2>/dev/null || true
+    fi
+
+    ok "面板访问权限已配置"
 }
 
 # sudo 白名单。
