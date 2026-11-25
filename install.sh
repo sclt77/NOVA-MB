@@ -236,6 +236,11 @@ main() {
     create_users
     create_dirs
     write_env_file
+
+    # 必须在 write_env_file 之后：这一步要修正 env 文件的属组，
+    # 让面板用户能读到数据库密码（否则「数据库」页报 Access denied）。
+    grant_panel_group
+
     setup_sudoers
     install_panel_binary
     install_scripts
