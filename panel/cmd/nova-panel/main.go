@@ -8,7 +8,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -70,7 +72,7 @@ func main() {
 	defer st.Close()
 
 	// 首次启动：创建管理员账号并打印初始密码
-	if err := bootstrapAdmin(st, *resetPass); err != nil {
+	if err := bootstrapAdmin(st, cfg.DataDir, *resetPass); err != nil {
 		log.Fatalf("初始化管理员失败: %v", err)
 	}
 	if *resetPass {
@@ -126,7 +128,7 @@ func main() {
 }
 
 // bootstrapAdmin 首次启动时创建管理员，或按参数重置密码。
-func bootstrapAdmin(st *store.Store, reset bool) error {
+func bootstrapAdmin(st *store.Store, dataDir string, reset bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -183,10 +185,12 @@ func bootstrapAdmin(st *store.Store, reset bool) error {
 
 	// 把初始密码写到文件，权限 600。
 	// 同时打印到终端——首次启动时用户正看着日志。
-	passFile := filepath.Join(os.Getenv("NOVA_PANEL_DATA_DIR"), "initial-password.txt")
-	if passFile == "/initial-password.txt" {
-		passFile = "/var/lib/nova/panel/initial-password.txt"
-	}
+	//
+	// 路径必须落在 DataDir 下。这里不能靠 os.Getenv("NOVA_PANEL_DATA_DIR")：
+	// systemd 没设这个变量时它是空字符串，filepath.Join("", "x") 得到的是
+	// 相对路径 "x"，文件会被写到 WorkingDirectory（/opt/nova/panel/），
+	// 用户按文档去 /var/lib/nova/panel/ 找不到。
+	passFile := filepath.Join(dataDir, "initial-password.txt")
 
 	_ = os.MkdirAll(filepath.Dir(passFile), 0o700)
 	_ = os.WriteFile(passFile,
@@ -210,6 +214,13 @@ func bootstrapAdmin(st *store.Store, reset bool) error {
 // 单页应用需要「找不到文件时回落到 index.html」，但**只能对页面路由生效**。
 // 静态资源（/static/、*.js、*.css）找不到时必须返回 404——
 // 回落成 index.html 会让浏览器把 HTML 当成 CSS 解析，报一堆莫名其妙的错。
+//
+// 缓存策略：全部 no-cache + 自算 ETag。
+//
+// 前端资源是 embed 进二进制的，文件名不带内容 hash，所以不能用长缓存。
+// 又因为 embed.FS 的文件没有真实修改时间，http.FileServer 生成不了
+// Last-Modified / ETag —— 直接设 no-cache 会导致每次访问都全量下载。
+// 所以这里按内容算一个 ETag 并自己处理 304。
 func staticHandler() (http.Handler, error) {
 	sub, err := fs.Sub(webFS, "web")
 	if err != nil {
@@ -217,6 +228,24 @@ func staticHandler() (http.Handler, error) {
 	}
 
 	fileServer := http.FileServer(http.FS(sub))
+
+	// 启动时把每个文件的内容哈希算好。
+	//
+	// 面板前端总共几十 KB，启动算一次可以忽略不计；
+	// 换来的是每个请求都不用重新读文件算 hash。
+	etags := make(map[string]string)
+	fs.WalkDir(sub, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		data, err := fs.ReadFile(sub, p)
+		if err != nil {
+			return nil
+		}
+		sum := sha256.Sum256(data)
+		etags["/"+p] = `"` + hex.EncodeToString(sum[:8]) + `"`
+		return nil
+	})
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -226,7 +255,10 @@ func staticHandler() (http.Handler, error) {
 
 		// 静态资源：直接交给 FileServer，找不到就是 404
 		if isStaticAsset(path) {
-			w.Header().Set("Cache-Control", "public, max-age=3600")
+			w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+			if serveIfNoneMatch(w, r, etags[path]) {
+				return
+			}
 			fileServer.ServeHTTP(w, r)
 			return
 		}
@@ -236,6 +268,12 @@ func staticHandler() (http.Handler, error) {
 			f.Close()
 			if path == "/index.html" {
 				w.Header().Set("Cache-Control", "no-store")
+			} else if et := etags[path]; et != "" {
+				// 其他静态页面（manifest 等）同样支持 304
+				w.Header().Set("ETag", et)
+				if serveIfNoneMatch(w, r, et) {
+					return
+				}
 			}
 			fileServer.ServeHTTP(w, r)
 			return
@@ -246,6 +284,19 @@ func staticHandler() (http.Handler, error) {
 		w.Header().Set("Cache-Control", "no-store")
 		fileServer.ServeHTTP(w, r)
 	}), nil
+}
+
+// serveIfNoneMatch 比对 If-None-Match，命中则直接写 304 并返回 true。
+func serveIfNoneMatch(w http.ResponseWriter, r *http.Request, etag string) bool {
+	if etag == "" {
+		return false
+	}
+	w.Header().Set("ETag", etag)
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return true
+	}
+	return false
 }
 
 // isStaticAsset 判断是否静态资源路径。
