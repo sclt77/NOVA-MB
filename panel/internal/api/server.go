@@ -39,6 +39,7 @@ type Server struct {
 	domain *service.DomainService
 	db     *service.DBService
 	cron   *service.CronService
+	git    *service.GitService
 
 	mux *http.ServeMux
 }
@@ -57,6 +58,12 @@ func New(cfg *config.Config, st *store.Store, am *auth.Manager, r *runner.Runner
 		domain: service.NewDomainService(cfg, r),
 		db:     service.NewDBService(cfg, r),
 		cron:   service.NewCronService(cfg, r),
+		git:    service.NewGitService(cfg.GitRoot, cfg.GitTokenFile),
+	}
+
+	// 仓库根目录在启动时就建好，避免第一次建仓库才发现权限问题
+	if err := s.git.EnsureRepoDirs(); err != nil {
+		log.Printf("准备代码仓库目录失败: %v", err)
 	}
 
 	s.routes()
@@ -116,6 +123,16 @@ func (s *Server) routes() {
 	// 改密码
 	m.HandleFunc("POST /api/password", s.authed(s.handleChangePassword))
 
+	// 代码仓库（面板管理用）
+	m.HandleFunc("GET /api/git", s.authed(s.handleGitOverview))
+	m.HandleFunc("POST /api/git/repos", s.authed(s.handleGitCreate))
+	m.HandleFunc("DELETE /api/git/repos/{name}", s.authed(s.handleGitDelete))
+	m.HandleFunc("GET /api/git/repos/{name}/commits", s.authed(s.handleGitCommits))
+	m.HandleFunc("GET /api/git/repos/{name}/tree", s.authed(s.handleGitTree))
+	m.HandleFunc("GET /api/git/repos/{name}/blob", s.authed(s.handleGitBlob))
+	m.HandleFunc("POST /api/git/toggle", s.authed(s.handleGitToggle))
+	m.HandleFunc("POST /api/git/token/reset", s.authed(s.handleGitResetToken))
+
 	s.mux = m
 }
 
@@ -126,10 +143,44 @@ func (s *Server) Handler(static http.Handler) http.Handler {
 	// API 走自己的路由
 	mux.Handle("/api/", s.mux)
 
+	// Git 协议端点。
+	//
+	// 单独挂在 /git/ 而不是 /api/ 下：git 客户端请求的是
+	// /<repo>.git/info/refs 这类固定格式的路径，不能带额外前缀。
+	// 鉴权走 Basic（token），不是面板会话——CI 系统没有 Cookie。
+	mux.Handle("/git/", service.NewGitHTTPHandler(
+		s.git,
+		s.gitEnabled,
+		s.gitRequestAuth,
+	))
+
 	// 其余交给静态文件
 	mux.Handle("/", static)
 
 	return securityHeaders(mux)
+}
+
+// gitRequestAuth 校验 git 协议请求的凭据。
+//
+// 支持两种：
+//  1. HTTP Basic —— Codemagic / git CLI 用。用户名随意（统一按 nova 处理），
+//     密码必须是 access token。
+//  2. 面板会话 Cookie —— 在浏览器里直接点 clone 链接时用，省得再输密码。
+//
+// 注意：不能用面板的账号密码做 Basic 认证。那等于把后台管理权限
+// 交给 CI 系统，而且用户改面板密码会静默打断构建。
+func (s *Server) gitRequestAuth(r *http.Request) bool {
+	// 先试 Basic
+	if _, pass, ok := r.BasicAuth(); ok {
+		return s.git.CheckToken(pass)
+	}
+
+	// 再试面板会话（浏览器场景）
+	if sess, _, err := s.auth.SessionFromRequest(r.Context(), r); err == nil && sess != nil {
+		return true
+	}
+
+	return false
 }
 
 // securityHeaders 加安全响应头。
@@ -775,8 +826,22 @@ func (s *Server) Run(static http.Handler) error {
 		Addr:              s.cfg.Addr(),
 		Handler:           s.Handler(static),
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		// 部署、备份、恢复都是长任务，写超时要放宽
+
+		// ReadTimeout 必须放宽到分钟级，不能是几十秒。
+		//
+		// 它限制的是「整个请求体读完」的耗时，从连接建立起就计时。
+		// 部署包有 70MB+，按 30 秒算，网速低于 2.4MB/s 就传不完，
+		// Go 会直接掐断连接 —— 浏览器侧只看到 `failed to fetch`，
+		// 没有 HTTP 状态码、没有响应体，面板日志里也不会有任何记录
+		// （请求在读取阶段就被丢弃了，还没进到 handler）。
+		//
+		// 这个坑极难排查：上传目录是空的、审计日志没有记录、
+		// nginx 错误日志也没有 413，看起来像「什么都没发生」。
+		//
+		// 30 分钟足够传 1GB（约 570KB/s），对家宽上行也够用。
+		ReadTimeout: 30 * time.Minute,
+
+		// 部署、备份、恢复都是长任务，写超时同样要放宽
 		WriteTimeout: 35 * time.Minute,
 		IdleTimeout:  120 * time.Second,
 	}
