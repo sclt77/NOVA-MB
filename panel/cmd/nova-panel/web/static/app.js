@@ -100,7 +100,19 @@ async function api(method, path, body) {
   }
 
   if (!data.ok) {
-    throw new Error(data.error || '操作失败');
+    // 命令执行失败时后端返回 {ok:false, data:{output:"..."}}，没有 error 字段。
+    // 真实原因在 data.output 里，不取出来用户只看到「操作失败」，
+    // 完全不知道哪一步出了问题。
+    var msg = data.error;
+    if (!msg && data.data && data.data.output) {
+      msg = data.data.output;
+    }
+    if (!msg) msg = '操作失败';
+
+    // 附带一个标记，让调用方能拿到完整结果对象（含 output、exitCode）
+    var err = new Error(msg);
+    err.result = data.data || null;
+    throw err;
   }
 
   return data.data;
@@ -110,12 +122,46 @@ async function uploadFile(path, file) {
   const form = new FormData();
   form.append('package', file);
 
-  const res = await fetch(path, {
-    method: 'POST',
-    headers: { 'X-CSRF-Token': state.csrf },
-    credentials: 'same-origin',
-    body: form,
-  });
+  let res;
+  try {
+    res = await fetch(path, {
+      method: 'POST',
+      headers: { 'X-CSRF-Token': state.csrf },
+      credentials: 'same-origin',
+      body: form,
+    });
+  } catch (e) {
+    // fetch 抛异常 = 请求在传输层就失败了，一个字节的响应都没收到。
+    //
+    // 最常见的原因是服务端把连接掐了（比如 ReadTimeout 到点），
+    // 浏览器统一报 "failed to fetch"，这个字符串对用户毫无意义 ——
+    // 它既不说清是网断了、包太大、还是服务挂了。
+    //
+    // 这里翻译成人能看懂的话，并给出具体的排查动作。
+    const mb = (file.size / 1024 / 1024).toFixed(1);
+    throw new Error(
+      `上传中断：${file.name}（${mb} MB）没有传完。\n\n` +
+      `常见原因：\n` +
+      `1. 网络不稳定或上行带宽太低，传输超时；\n` +
+      `2. 服务端读取超时（部署包较大时容易触发）；\n` +
+      `3. 端口转发断开（SSH -L 窗口被关掉或休眠）。\n\n` +
+      `建议：\n` +
+      `· 确认转发窗口还开着，然后重试；\n` +
+      `· 网络差的话，用 scp 直接传到服务器 ` +
+      `/var/lib/nova/panel/packages/ 再从列表选择部署。\n\n` +
+      `原始错误：${e.message}`
+    );
+  }
+
+  // 413：请求体超过服务端上限。Nginx 或面板本身都可能拦。
+  if (res.status === 413) {
+    const mb = (file.size / 1024 / 1024).toFixed(1);
+    throw new Error(
+      `文件太大被拒绝：${file.name}（${mb} MB）\n\n` +
+      `服务端允许的上限更小。请检查 Nginx 的 client_max_body_size ` +
+      `与面板的 MaxUploadBytes 配置。`
+    );
+  }
 
   const data = await res.json().catch(() => ({ ok: false, error: '响应异常' }));
 
@@ -251,6 +297,7 @@ const PAGES = {
   domain:   { title: '域名证书', sub: '域名绑定与 SSL 自动续期', render: renderDomain, load: loadDomain },
   database: { title: '数据库', sub: '表结构与容量（只读）', render: renderDatabase, load: loadDatabase },
   cron:     { title: '定时任务', sub: '备份、健康检查与证书续期', render: renderCron, load: loadCron },
+  git:      { title: '代码仓库', sub: '给 Codemagic 拉取源码打包用', render: renderGit, load: loadGit },
   logs:     { title: '日志', sub: '应用与 Nginx 日志', render: renderLogs, load: loadLogs },
   audit:    { title: '操作记录', sub: '所有写操作的审计日志', render: renderAudit, load: loadAudit },
   settings: { title: '设置', sub: '账号与安全', render: renderSettings, load: null },
@@ -561,7 +608,14 @@ async function doUpload(file) {
     await loadDeploy();
 
   } catch (e) {
-    toast(e.message, 'err');
+    // 部署失败时一定要弹窗显示完整命令输出，不能只 toast 一句「操作失败」。
+    // 部署涉及备份、解压、切版本、健康检查多个步骤，用户必须能看到
+    // 是哪一步失败了、失败原因是什么。
+    if (e.result && e.result.output) {
+      showModal('部署失败', false, e.result.output, e.result.durationMs);
+    } else {
+      showModal('部署失败', false, e.message, 0);
+    }
     await loadDeploy();
   }
 }
@@ -1201,6 +1255,311 @@ function renderSettings() {
       toast(e.message, 'err');
     }
   };
+}
+
+// ============================================================ 代码仓库
+//
+// 这一页只做两件事：管仓库、开关公网访问。
+//
+// 设计上刻意把「开关」放在最显眼的位置：仓库平时是关闭的，
+// 公网访问 /git/ 直接 404。要用 Codemagic 打包时才打开，打完关掉。
+// 这不是洁癖——服务器只有一个公网 IP，仓库开着等于把一个
+// 代码托管服务长期暴露在扫描器面前。
+
+async function loadGit() {
+  const data = await api('GET', '/api/git');
+  state.data.git = data;
+  renderGit();
+}
+
+function renderGit() {
+  const g = state.data.git;
+  if (!g) return;
+
+  const enabled = g.enabled;
+  const repos = g.repos || [];
+
+  // 没有公网地址时，clone 地址是空的，必须提示用户去配
+  const noPublicURL = !g.baseUrl;
+
+  let html = `
+  <div class="card" style="margin-bottom:14px">
+    <div class="card-head">
+      <div>
+        <h3>公网访问 ${enabled
+          ? '<span class="badge ok">已开启</span>'
+          : '<span class="badge plain">已关闭</span>'}</h3>
+        <div class="card-sub">
+          ${enabled
+            ? 'Codemagic 现在可以拉取代码。打包完成后建议立即关闭。'
+            : '仓库当前不对外暴露，/git/ 路径返回 404。需要打包时再开启。'}
+        </div>
+      </div>
+      <button class="btn ${enabled ? 'btn-danger' : 'btn-primary'}" id="git-toggle">
+        ${enabled ? '关闭访问' : '开启访问'}
+      </button>
+    </div>`;
+
+  if (noPublicURL) {
+    html += `
+    <div class="hint" style="border-color:rgba(239,68,68,.4);color:#f87171">
+      没检测到公网地址。面板监听在 127.0.0.1，是通过 SSH 端口转发访问的，
+      Codemagic 拿不到这个地址。<br>
+      请在 <code>/etc/nova/panel.env</code> 里加一行
+      <code>NOVA_PUBLIC_URL=http://你的公网IP</code>，然后重启面板。
+    </div>`;
+  } else if (enabled) {
+    html += `
+    <div class="hint">
+      <b>仓库地址</b>（Codemagic 里填这个）：<br>
+      <code>${esc(g.baseUrl)}/git/&lt;仓库名&gt;.git</code><br><br>
+      <b>认证</b>：用户名 <code>nova</code>，密码填下面的 access token。<br>
+      注意：必须走 HTTP Basic，Codemagic 的 Git 凭据类型选「用户名 + 密码」。
+    </div>`;
+  }
+
+  html += `</div>`;
+
+  // 令牌卡片
+  html += `
+  <div class="card" style="margin-bottom:14px">
+    <div class="card-head">
+      <div>
+        <h3>访问令牌</h3>
+        <div class="card-sub">Codemagic 拉代码用的密码。泄露了就重置。</div>
+      </div>
+      <button class="btn btn-sm" id="git-reset-token">重置令牌</button>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input id="git-token" readonly
+             value="${esc(g.token || '（尚未生成，开启访问时自动创建）')}"
+             style="flex:1;font-family:var(--mono);font-size:12px;padding:8px 10px;
+                    background:var(--bg-input,#12151b);color:var(--text);
+                    border:1px solid var(--border);border-radius:6px">
+      <button class="btn btn-sm" id="git-copy-token" ${g.token ? '' : 'disabled'}>复制</button>
+    </div>
+  </div>`;
+
+  // 仓库列表
+  html += `
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <h3>仓库</h3>
+        <div class="card-sub">共 ${repos.length} 个</div>
+      </div>
+      <button class="btn btn-sm btn-primary" id="git-create">新建仓库</button>
+    </div>`;
+
+  if (!repos.length) {
+    html += `<div class="empty"><div class="big">⎇</div>
+      <p>还没有仓库。新建一个，然后把源码 push 上来。</p></div>`;
+  } else {
+    html += `<table class="table">
+      <thead><tr>
+        <th>仓库</th><th>分支</th><th>提交</th><th>大小</th><th>最近提交</th><th></th>
+      </tr></thead><tbody>`;
+
+    for (const r of repos) {
+      const when = r.lastCommitAt ? fmtWhen(r.lastCommitAt) : '—';
+      html += `<tr>
+        <td>
+          <b>${esc(r.name)}</b>
+          ${r.lastCommitMsg
+            ? `<div class="muted" style="font-size:11.5px">${esc(r.lastCommitMsg)}</div>`
+            : '<div class="muted" style="font-size:11.5px">空仓库</div>'}
+        </td>
+        <td>${r.branch ? `<code>${esc(r.branch)}</code>` : '—'}</td>
+        <td>${r.commitCount || 0}</td>
+        <td>${fmtBytes(r.sizeBytes)}</td>
+        <td class="muted" style="font-size:12px">${when}</td>
+        <td style="text-align:right;white-space:nowrap">
+          <button class="btn btn-sm" data-copy-clone="${esc(r.cloneUrl)}">复制地址</button>
+          <button class="btn btn-sm btn-danger" data-del-repo="${esc(r.name)}">删除</button>
+        </td>
+      </tr>`;
+    }
+    html += `</tbody></table>`;
+  }
+
+  html += `</div>`;
+
+  $('#page-content').innerHTML = html;
+
+  // ---- 事件绑定
+  $('#git-toggle').onclick = () => gitToggle(!enabled);
+  $('#git-reset-token').onclick = gitResetToken;
+  $('#git-create').onclick = gitCreate;
+
+  const copyBtn = $('#git-copy-token');
+  if (copyBtn && g.token) {
+    copyBtn.onclick = () => copyToClipboard(g.token, '令牌已复制');
+  }
+
+  $$('[data-copy-clone]').forEach((el) => {
+    el.onclick = () => copyToClipboard(el.dataset.copyClone, '仓库地址已复制');
+  });
+
+  $$('[data-del-repo]').forEach((el) => {
+    el.onclick = () => gitDelete(el.dataset.delRepo);
+  });
+}
+
+// fmtWhen 把 ISO 时间转成「几分钟前」这种可读形式。
+function fmtWhen(iso) {
+  const t = Date.parse(iso);
+  if (isNaN(t)) return iso;
+  const diff = (Date.now() - t) / 1000;
+  if (diff < 60) return '刚刚';
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)} 天前`;
+  return new Date(t).toLocaleDateString();
+}
+
+async function copyToClipboard(text, tip) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(tip || '已复制');
+  } catch (e) {
+    // 非 HTTPS 或权限被拒时 clipboard API 不可用，回落到选中
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy');
+      toast(tip || '已复制');
+    } catch (_) {
+      toast('复制失败，请手动选中', 'err');
+    }
+    ta.remove();
+  }
+}
+
+async function gitToggle(enable) {
+  const ok = await confirmDialog({
+    title: enable ? '开启公网访问' : '关闭公网访问',
+    text: enable
+      ? '开启后，任何拿到 access token 的人都能 clone 仓库。\n'
+        + 'Codemagic 打包完成后，记得回来关闭。'
+      : '关闭后 /git/ 立即返回 404，正在进行的 clone 会中断。\n'
+        + '已经拉下来的代码不受影响。',
+    okText: enable ? '开启' : '关闭',
+    danger: !enable,
+  });
+  if (!ok) return;
+
+  try {
+    await api('POST', '/api/git/toggle', { enabled: enable });
+    toast(enable ? '已开启公网访问' : '已关闭公网访问');
+    await loadGit();
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function gitResetToken() {
+  const ok = await confirmDialog({
+    title: '重置访问令牌',
+    text: '旧令牌会立即失效，正在使用它的 Codemagic 构建会拉不到代码。\n'
+        + '重置后请到 Codemagic 里更新凭据。',
+    okText: '重置',
+    danger: true,
+  });
+  if (!ok) return;
+
+  try {
+    const res = await api('POST', '/api/git/token/reset');
+    toast('新令牌已生成');
+    await loadGit();
+    copyToClipboard(res.token, '新令牌已复制');
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function gitCreate() {
+  const name = await promptDialog({
+    title: '新建仓库',
+    label: '仓库名（小写字母、数字、- _ .）',
+    placeholder: 'novaqd',
+    hint: '建议用 novaqd（前端）和 novahd（后端）分开建。',
+  });
+  if (!name) return;
+
+  try {
+    await api('POST', '/api/git/repos', { name, description: '' });
+    toast('仓库已创建');
+    await loadGit();
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+async function gitDelete(name) {
+  const ok = await confirmDialog({
+    title: `删除仓库 ${name}`,
+    text: `仓库 ${name}.git 及其全部提交历史将被永久删除，无法恢复。\n\n`
+        + `如果只是想暂时不让人访问，用上面的「关闭访问」即可。`,
+    okText: '永久删除',
+    requireText: name,
+    danger: true,
+  });
+  if (!ok) return;
+
+  try {
+    await api('DELETE', `/api/git/repos/${encodeURIComponent(name)}`);
+    toast('仓库已删除');
+    await loadGit();
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
+// promptDialog 单输入框弹窗。
+//
+// 原生 prompt() 在 Electron 里能用，但样式和面板完全不搭，
+// 而且无法做输入校验提示。这里自己实现一个。
+function promptDialog({ title, label, placeholder = '', hint = '' }) {
+  return new Promise((resolve) => {
+    const mask = document.createElement('div');
+    mask.className = 'modal-mask';
+    mask.innerHTML = `
+      <div class="modal sm">
+        <div class="modal-head">
+          <h3>${esc(title)}</h3>
+          <button class="link-btn" data-cancel>✕</button>
+        </div>
+        <div class="modal-body">
+          <label class="muted" style="font-size:12.5px">${esc(label)}</label>
+          <input id="pd-input" placeholder="${esc(placeholder)}"
+                 style="margin-top:6px;width:100%;padding:8px 10px;
+                        background:var(--bg-input,#12151b);color:var(--text);
+                        border:1px solid var(--border);border-radius:6px;
+                        font-size:13px;outline:none" autocomplete="off">
+          ${hint ? `<div class="muted" style="font-size:12px;margin-top:8px">${esc(hint)}</div>` : ''}
+        </div>
+        <div class="modal-foot">
+          <button class="btn" data-cancel>取消</button>
+          <button class="btn btn-primary" data-ok>确定</button>
+        </div>
+      </div>`;
+    document.body.appendChild(mask);
+
+    const input = mask.querySelector('#pd-input');
+    const close = (val) => { mask.remove(); resolve(val); };
+
+    input.focus();
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') close(input.value.trim() || null);
+      if (e.key === 'Escape') close(null);
+    };
+    mask.querySelectorAll('[data-cancel]').forEach((b) => {
+      b.onclick = () => close(null);
+    });
+    mask.querySelector('[data-ok]').onclick = () => close(input.value.trim() || null);
+  });
 }
 
 // ============================================================ 启动
