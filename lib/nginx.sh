@@ -34,6 +34,10 @@ write_nginx_site() {
     local backend_port="${2:-8080}"
     local web_root="/opt/nova/app/web"
 
+    # 面板端口：/git/ 要反代到这里。
+    # 用 NOVA_PANEL_PORT 环境变量（安装脚本里已设置），默认 8888。
+    local panel_port="${NOVA_PANEL_PORT:-8888}"
+
     local conf_path="/etc/nginx/conf.d/nova.conf"
     [[ "$OS_FAMILY" == "debian" ]] && conf_path="/etc/nginx/sites-available/nova.conf"
 
@@ -132,6 +136,39 @@ server {
         proxy_set_header Connection "upgrade";
         proxy_set_header Host \$host;
         proxy_read_timeout 3600s;
+    }
+
+    # 代码仓库（Git Smart HTTP）
+    #
+    # 反代到面板的 8888 端口，不是后端 8080。
+    # 仓库功能由面板自己实现（git http-backend），不是业务后端的一部分。
+    #
+    # 必须显式配这一段：下面 location / 会把所有未匹配路径交给前端 SPA，
+    # 导致 /git/xxx.git/info/refs 返回 index.html，git 客户端报
+    # "not a git repository" 或直接解析失败。
+    #
+    # client_max_body_size 要给足：push 时整个 packfile 走 POST 请求体，
+    # Flutter 项目首次推送轻松超过 30MB，用全局的 30m 会被 413 拦掉。
+    location /git/ {
+        proxy_pass http://127.0.0.1:${panel_port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        # Git 协议需要透传这些头，否则 push 会失败
+        proxy_set_header Authorization \$http_authorization;
+        proxy_request_buffering off;
+        client_max_body_size 1024m;
+
+        # clone 大仓库可能持续几分钟
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_connect_timeout 10s;
+
+        # 禁用缓冲：packfile 是流式的，缓冲会让内存暴涨且延迟变大
+        proxy_buffering off;
     }
 
     # 前端单页应用：找不到文件时回落到 index.html
