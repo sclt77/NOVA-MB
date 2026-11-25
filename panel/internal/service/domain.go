@@ -257,6 +257,30 @@ func (s *DomainService) writeLocationBlocks(b *strings.Builder, webRoot, backend
         proxy_read_timeout 3600s;
     }
 
+    # 代码仓库（Git Smart HTTP），反代到面板自己。
+    #
+    # 必须显式配：下面的 location / 会把未匹配路径交给前端 SPA，
+    # /git/xxx.git/info/refs 会返回 index.html，git 客户端直接解析失败。
+    #
+    # push 时 packfile 走 POST 请求体，Flutter 项目首次推送轻松超 30MB，
+    # 所以这里单独放开到 1G，不受全局 client_max_body_size 限制。
+    location /git/ {
+`)
+	fmt.Fprintf(b, "        proxy_pass http://127.0.0.1:%d;\n", s.cfg.Port)
+	b.WriteString(`        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Authorization $http_authorization;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        client_max_body_size 1024m;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_connect_timeout 10s;
+    }
+
     location / {
         try_files $uri $uri/ /index.html;
     }
