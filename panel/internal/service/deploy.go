@@ -309,6 +309,23 @@ func (s *BackupService) List() ([]Backup, error) {
 		if os.IsNotExist(err) {
 			return []Backup{}, nil
 		}
+		// 权限问题是这里最常见的失败原因，而且原始报错
+		// "permission denied" 不会告诉用户该怎么修。
+		//
+		// 背景：备份目录属主是业务用户 nova，面板以 nova-panel 身份运行。
+		// 两者本来是不同用户，只有把 nova-panel 加入 nova 组、
+		// 目录给组读权限，面板才列得出备份。
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf(
+				"没有权限读取备份目录 %s\n"+
+					"解决办法（二选一）：\n"+
+					"  1. 重新执行安装脚本，会自动修正权限；\n"+
+					"  2. 手动执行：\n"+
+					"     usermod -aG nova nova-panel\n"+
+					"     chgrp -R nova %s && chmod -R g+r %s\n"+
+					"     systemctl restart nova-panel",
+				s.cfg.BackupDir, s.cfg.BackupDir, s.cfg.BackupDir)
+		}
 		return nil, err
 	}
 
