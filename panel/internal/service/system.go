@@ -243,25 +243,42 @@ type LogFile struct {
 // 白名单固定，不接受用户传路径——否则就是任意文件读取漏洞。
 func (s *LogService) Files() []LogFile {
 	candidates := []LogFile{
-		{Key: "nova-api.log", Label: "应用日志", Path: filepath.Join(s.cfg.LogDir, "nova-api.log")},
+		{Key: "nova-api", Label: "应用日志", Path: ""}, // 走 journald，见 Tail
 		{Key: "install.log", Label: "安装日志", Path: filepath.Join(s.cfg.LogDir, "install.log")},
 		{Key: "cron.log", Label: "定时任务日志", Path: filepath.Join(s.cfg.LogDir, "cron.log")},
-		{Key: "panel", Label: "面板日志", Path: filepath.Join(s.cfg.LogDir, "panel.log")},
+		{Key: "panel", Label: "面板日志", Path: ""}, // 同样走 journald
 		{Key: "nginx-error", Label: "Nginx 错误日志", Path: "/var/log/nginx/error.log"},
 		{Key: "nginx-access", Label: "Nginx 访问日志", Path: "/var/log/nginx/access.log"},
 	}
 
 	out := make([]LogFile, 0, len(candidates))
 	for _, f := range candidates {
+		if f.Path == "" {
+			// journald 来源：大小无从得知，给个 0 让前端照常渲染
+			out = append(out, f)
+			continue
+		}
 		if st, err := os.Stat(f.Path); err == nil {
 			f.Size = st.Size()
-			out = append(out, f)
-		} else {
-			// 文件不存在也列出来，让用户知道有这一项（大小 0）
-			out = append(out, f)
 		}
+		// 文件不存在也列出来（大小 0），前端会提示「暂无日志」
+		out = append(out, f)
 	}
 	return out
+}
+
+// journaldUnits 日志键 → systemd 单元名。
+//
+// 为什么不写日志文件：
+//
+//	nova-api 与 nova-panel 都由 systemd 托管，输出默认进 journald。
+//	之前这里假设存在 /var/log/nova/nova-api.log，但那个文件根本不会被创建，
+//	于是「日志」页永远显示「读取失败：无法打开日志文件」。
+//	正确做法是直接读 journald，而不是再配一套 logback 文件输出——
+//	多一份日志文件就多一处轮转、权限、磁盘占用的负担。
+var journaldUnits = map[string]string{
+	"nova-api": "nova-api",
+	"panel":    "nova-panel",
 }
 
 // Tail 读日志尾部。
@@ -269,6 +286,15 @@ func (s *LogService) Files() []LogFile {
 // maxLines 限制在 2000 行内：日志文件可能几百 MB，
 // 全读进内存会把面板自己搞崩。
 func (s *LogService) Tail(key string, maxLines int) (string, error) {
+	if maxLines <= 0 || maxLines > 2000 {
+		maxLines = 500
+	}
+
+	// journald 来源优先
+	if unit, ok := journaldUnits[key]; ok {
+		return s.tailJournal(unit, maxLines)
+	}
+
 	var path string
 	found := false
 	for _, f := range s.Files() {
@@ -278,17 +304,22 @@ func (s *LogService) Tail(key string, maxLines int) (string, error) {
 			break
 		}
 	}
-	if !found {
+	if !found || path == "" {
 		return "", fmt.Errorf("未知日志")
 	}
 
-	if maxLines <= 0 || maxLines > 2000 {
-		maxLines = 500
+	if _, err := os.Stat(path); err != nil {
+		return "", fmt.Errorf("日志文件不存在：%s\n（该服务可能未运行，或日志尚未产生）", path)
 	}
 
 	f, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("无法打开日志文件")
+		// 区分「不存在」和「没权限」——两者的解决办法完全不同
+		if os.IsPermission(err) {
+			return "", fmt.Errorf("没有权限读取 %s\n"+
+				"面板以 nova-panel 身份运行，需要读该文件的组权限。", path)
+		}
+		return "", fmt.Errorf("无法打开日志文件：%v", err)
 	}
 	defer f.Close()
 
@@ -330,6 +361,57 @@ func (s *LogService) Tail(key string, maxLines int) (string, error) {
 }
 
 // ---------------------------------------------------------------- 工具
+
+// tailJournal 从 journald 读某个单元的日志尾部。
+//
+// 用 journalctl 而不是读 /var/log/journal 的二进制文件：
+// journald 的存储格式是私有的、带索引的，自己解析既脆弱又没必要。
+//
+// 参数说明：
+//   -n N           取最近 N 行
+//   --no-pager     不要调用 less（非 TTY 下会卡住）
+//   -o short-iso   时间戳用 ISO 格式，前端好按时间排序
+//   --no-hostname  去掉主机名，省一行宽度
+func (s *LogService) tailJournal(unit string, maxLines int) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := execCommandContext(ctx, "/usr/bin/journalctl",
+		"-u", unit,
+		"-n", strconv.Itoa(maxLines),
+		"--no-pager",
+		"--no-hostname",
+		"-o", "short-iso",
+	)
+	// journalctl 读系统日志需要 systemd-journal 组权限。
+	// 面板用户不在该组时会报 "No journal files were found"，
+	// 这里把 stderr 一起收回来，好给用户看真实原因。
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+
+	if err != nil {
+		if strings.Contains(text, "No journal files") ||
+			strings.Contains(text, "not seeing messages") {
+			return "", fmt.Errorf(
+				"面板没有权限读取系统日志。\n"+
+					"解决办法：usermod -aG systemd-journal nova-panel 后重启面板。\n"+
+					"（安装脚本会自动处理；如果手动改过用户组，需要重新登录生效）")
+		}
+		return "", fmt.Errorf("读取 journald 失败：%s", text)
+	}
+
+	if text == "" {
+		return "（暂无日志）", nil
+	}
+
+	// journalctl 已经按时间正序输出（旧→新），
+	// 但面板其他日志都是「最新的在最上面」，这里统一反转。
+	lines := strings.Split(text, "\n")
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	return strings.Join(lines, "\n"), nil
+}
 
 // mysqlUnitName 返回 MySQL 的服务名（Debian 系 mysql，RHEL 系 mysqld）。
 func mysqlUnitName() string {
