@@ -51,6 +51,12 @@ type Config struct {
 
 	// 部署包上传大小上限（字节）
 	MaxUploadBytes int64
+
+	// 代码仓库根目录。每个仓库一个 <name>.git 子目录。
+	GitRoot string
+
+	// Git 访问令牌文件（Codemagic 用 Basic 认证的密码）
+	GitTokenFile string
 }
 
 // Load 读取配置。cfgPath 为空时只用环境变量与默认值。
@@ -93,6 +99,8 @@ func defaults() *Config {
 		MySQLService:   "mysql",
 		BackendPort:    8080,
 		MaxUploadBytes: 500 << 20, // 500MB
+		GitRoot:        "/var/lib/nova/git",
+		GitTokenFile:   "/var/lib/nova/panel/git-token",
 	}
 }
 
@@ -179,6 +187,10 @@ func set(c *Config, key, value string) error {
 			return fmt.Errorf("backend_port 必须是数字：%q", value)
 		}
 		c.BackendPort = n
+	case "git_root":
+		c.GitRoot = value
+	case "git_token_file":
+		c.GitTokenFile = value
 	default:
 		// 未知配置项直接报错，避免拼错了却静默生效
 		return fmt.Errorf("未知配置项：%s", key)
