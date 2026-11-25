@@ -66,11 +66,21 @@ func (s *DBService) Info() *DBInfo {
 	// 测试连接
 	out, err := s.query("SELECT VERSION()")
 	if err != nil {
-		info.Error = "无法连接数据库：" + strings.TrimSpace(out)
+		msg := "无法连接数据库：" + strings.TrimSpace(out)
+		// 优先给出权限相关的提示：九成情况是这个原因，
+		// 而原始报错（Access denied ... using password: NO）会把人引向
+		// 「密码配错了」这条完全错误的方向。
+		if hint := s.credentialHint(); hint != "" {
+			msg = hint
+		}
+		info.Error = msg
 		return info
 	}
 	info.Connected = true
-	info.Version = strings.TrimSpace(out)
+	// 版本号取最后一行非空内容：即使有残留的警告行在前面，
+	// 真正的结果也总在最后。
+	verLines := strings.Split(strings.TrimSpace(out), "\n")
+	info.Version = strings.TrimSpace(verLines[len(verLines)-1])
 
 	// 连接数
 	if out, err := s.query("SELECT COUNT(*) FROM information_schema.PROCESSLIST"); err == nil {
@@ -93,7 +103,12 @@ func (s *DBService) Info() *DBInfo {
 		SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2)
 		FROM information_schema.TABLES WHERE table_schema = '%s'`, dbName)
 	if out, err := s.query(sizeQuery); err == nil {
-		info.SizeMB, _ = strconv.ParseFloat(strings.TrimSpace(out), 64)
+		// 同样取最后一行：NULL 或空结果时返回 0 而不是报错
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		last := strings.TrimSpace(lines[len(lines)-1])
+		if last != "" && last != "NULL" {
+			info.SizeMB, _ = strconv.ParseFloat(last, 64)
+		}
 	}
 
 	// 表列表
@@ -179,8 +194,16 @@ func (s *DBService) dbName() string {
 func (s *DBService) mysqlArgs(query string) []string {
 	rootCnf := "/etc/nova/.mysql-root.cnf"
 
-	// 优先用 root 配置（能查 information_schema 的完整信息）
-	if _, err := os.Stat(rootCnf); err == nil {
+	// 优先用 root 配置（能查 information_schema 的完整信息）。
+	//
+	// 注意这里必须用 os.Open 而不是 os.Stat：
+	// 文件存在 ≠ 能读。这个 cnf 是 600 root:root，面板以 nova-panel 身份
+	// 运行时 Stat 成功、Open 失败，之前就是因此走进了「退回业务账号」分支。
+	// 而业务账号的密码又因为 env 文件读不到而变成空串，
+	// 最终报 "Access denied ... (using password: NO)" ——
+	// 错误信息完全没提到权限，看起来像密码配错了。
+	if f, err := os.Open(rootCnf); err == nil {
+		f.Close()
 		return []string{"--defaults-file=" + rootCnf, "-N", "-B", "-e", query}
 	}
 
@@ -188,14 +211,24 @@ func (s *DBService) mysqlArgs(query string) []string {
 	dbUser, dbPass := s.dbCredentials()
 
 	// 密码通过环境变量传，不放命令行参数（命令行参数在 ps 里可见）
-	return []string{
+	args := []string{
 		"-h", "127.0.0.1",
 		"-u", dbUser,
-		"-p" + dbPass,
 		"-N", "-B", "-e", query,
 	}
+	// 只有真拿到密码才加 -p。
+	// 加一个空的 -p 会让 mysql 交互式提示输入密码，
+	// 在非 TTY 环境下直接报 "using password: NO"，掩盖真实原因。
+	if dbPass != "" {
+		args = append(args, "-p"+dbPass)
+	}
+	return args
 }
 
+// dbCredentials 从环境变量文件读业务账号。
+//
+// 第二个返回值表示「是否真的读到了密码」。读不到时调用方要给出
+// 明确提示，而不是拿空密码去连库然后报一个误导性的错误。
 func (s *DBService) dbCredentials() (string, string) {
 	user, pass := "nova", ""
 
@@ -216,8 +249,53 @@ func (s *DBService) dbCredentials() (string, string) {
 	return user, pass
 }
 
+// credentialHint 在连库失败时给出可操作的排查提示。
+//
+// 光把 mysql 的原始报错丢给用户没用：`Access denied (using password: NO)`
+// 看起来像密码配错，实际九成是权限问题——面板读不到配置文件。
+func (s *DBService) credentialHint() string {
+	rootCnf := "/etc/nova/.mysql-root.cnf"
+
+	if _, err := os.Stat(rootCnf); err == nil {
+		if f, openErr := os.Open(rootCnf); openErr != nil {
+			return fmt.Sprintf(
+				"面板没有权限读取 %s（属主 root、权限 600）。\n"+
+					"解决办法：把 nova-panel 加入 nova 组，并确认该文件属组为 nova，\n"+
+					"或重新执行安装脚本（会自动修正权限）。", rootCnf)
+		} else {
+			f.Close()
+		}
+	}
+
+	if _, err := os.ReadFile(s.cfg.EnvFile); err != nil {
+		return fmt.Sprintf(
+			"面板没有权限读取 %s，拿不到数据库密码。\n"+
+				"解决办法：chown root:nova %s && chmod 640 %s，\n"+
+				"并确认 nova-panel 已在 nova 组里（usermod -aG nova nova-panel）。",
+			s.cfg.EnvFile, s.cfg.EnvFile, s.cfg.EnvFile)
+	}
+
+	return ""
+}
+
 func (s *DBService) query(q string) (string, error) {
-	return runWithTimeout(15*time.Second, "/usr/bin/mysql", s.mysqlArgs(q)...)
+	out, err := runWithTimeout(15*time.Second, "/usr/bin/mysql", s.mysqlArgs(q)...)
+	// mysql 客户端会往输出里混一行警告：
+	//   mysql: [Warning] Using a password on the command line interface can be insecure.
+	// 这行不是 SQL 结果，但 CombinedOutput 把它和 stdout 混在一起，
+	// 导致版本号变成「警告 + 版本」、数字解析失败（sizeMB 变 0）。
+	// 逐行过滤掉以 mysql: 开头的行。
+	if out != "" {
+		var kept []string
+		for _, line := range strings.Split(out, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "mysql: [Warning]") {
+				continue
+			}
+			kept = append(kept, line)
+		}
+		out = strings.Join(kept, "\n")
+	}
+	return out, err
 }
 
 // ---------------------------------------------------------------- 定时任务
